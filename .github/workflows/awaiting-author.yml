@@ -1,7 +1,8 @@
 name: Label PRs awaiting author
 
-# Marks open PRs where the *author* has been silent for 8 weeks (comment,
-# review reply, or commit). Distinct from stale.yml, which uses any activity.
+# Marks open PRs where review feedback has gone unanswered by the *author*
+# for 8 weeks. Distinct from stale.yml, which uses any activity. PRs with no
+# human review yet are skipped — the author is waiting on maintainers.
 
 on:
   schedule:
@@ -18,7 +19,7 @@ jobs:
       issues: read  # to check that the awaiting-author label exists
       pull-requests: write
     steps:
-      - name: Label PRs with no author activity for 8 weeks
+      - name: Label PRs with unanswered review feedback for 8 weeks
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -38,6 +39,9 @@ jobs:
           fi
 
           is_bot() {
+            case "$1" in
+              *"[bot]") return 0 ;;
+            esac
             local b
             for b in "dependabot[bot]" "renovate[bot]" "github-actions[bot]"; do
               if [ "$1" = "$b" ]; then
@@ -47,11 +51,12 @@ jobs:
             return 1
           }
 
+          # Newest comment / review / review-reply / commit by the PR author.
+          # Empty if GraphQL returned none — do not fall back to createdAt;
+          # unanswered-review timing is based on last_reviewer_activity.
           last_author_activity() {
             local author="$1"
-            local created="$2"
-            local last
-            last="$(jq -r --arg author "$author" '
+            jq -r --arg author "$author" '
               def lc: ascii_downcase;
               def is_author: ((.login // "") | lc) == ($author | lc);
               [
@@ -64,11 +69,27 @@ jobs:
                     or (([$c.authors.nodes[]? | (.user.login // "")] | map(lc) | index($author | lc)) != null)
                   ) | $c.committedDate)
               ] | map(select(. != null and . != "")) | if length == 0 then empty else max end
-            ')"
-            if [ -z "$last" ] || [ "$last" = "null" ]; then
-              last="$created"
-            fi
-            printf '%s' "$last"
+            '
+          }
+
+          # Newest human, non-author issue comment, review, or review-thread
+          # comment. Bots (CI, stale, apps) do not count as review feedback.
+          last_reviewer_activity() {
+            local author="$1"
+            jq -r --arg author "$author" '
+              def lc: ascii_downcase;
+              def login: (.login // "") | lc;
+              def is_bot:
+                ((.__typename // "") == "Bot")
+                or (login | test("\\[bot\\]$"));
+              def is_reviewer:
+                (login != ($author | lc)) and (login != "") and (is_bot | not);
+              [
+                (.comments.nodes[]? | select(.author | is_reviewer) | .createdAt),
+                (.reviews.nodes[]? | select((.author | is_reviewer) and .submittedAt != null) | .submittedAt),
+                (.reviewThreads.nodes[]? | .comments.nodes[]? | select(.author | is_reviewer) | .createdAt)
+              ] | map(select(. != null and . != "")) | if length == 0 then empty else max end
+            '
           }
 
           LIST_QUERY='
@@ -92,8 +113,8 @@ jobs:
           query($owner: String!, $name: String!, $number: Int!) {
             repository(owner: $owner, name: $name) {
               pullRequest(number: $number) {
-                comments(last: 100) { nodes { createdAt author { login } } }
-                reviews(last: 100) { nodes { submittedAt author { login } } }
+                comments(last: 100) { nodes { createdAt author { __typename login } } }
+                reviews(last: 100) { nodes { submittedAt author { __typename login } } }
                 commits(last: 100) {
                   nodes {
                     commit {
@@ -105,7 +126,7 @@ jobs:
                 }
                 reviewThreads(last: 100) {
                   nodes {
-                    comments(last: 50) { nodes { createdAt author { login } } }
+                    comments(last: 50) { nodes { createdAt author { __typename login } } }
                   }
                 }
               }
@@ -152,13 +173,13 @@ jobs:
               continue
             fi
 
-            # Too new to be waiting 8 weeks, and no label to remove.
+            # Too new for an 8-week unanswered review, and no label to remove.
             if [[ "$created" > "$CUTOFF" ]] && [ "$labeled_already" != "true" ]; then
               skipped=$((skipped + 1))
               continue
             fi
 
-            # Label cannot be valid yet: createdAt is more recent than the cutoff.
+            # A review cannot be older than the PR; the label cannot be valid yet.
             if [[ "$created" > "$CUTOFF" ]]; then
               echo "Removing ${LABEL} from #${number} (PR younger than ${DAYS} days)"
               if gh pr edit "$number" --remove-label "$LABEL"; then
@@ -179,29 +200,39 @@ jobs:
             fi
 
             pr_data="$(jq '.data.repository.pullRequest' <<<"$activity_resp")"
-            last="$(printf '%s' "$pr_data" | last_author_activity "$author" "$created")"
+            last_author="$(printf '%s' "$pr_data" | last_author_activity "$author")"
+            last_reviewer="$(printf '%s' "$pr_data" | last_reviewer_activity "$author")"
 
-            if [[ "$last" < "$CUTOFF" ]]; then
+            awaiting="false"
+            if [ -n "$last_reviewer" ] && [[ "$last_reviewer" < "$CUTOFF" ]]; then
+              if [ -z "$last_author" ] || [[ "$last_author" < "$last_reviewer" ]]; then
+                awaiting="true"
+              fi
+            fi
+
+            if [ "$awaiting" = "true" ]; then
               if [ "$labeled_already" != "true" ]; then
-                echo "Labeling #${number} (last author activity ${last})"
+                echo "Labeling #${number} (unanswered review ${last_reviewer}, last author activity ${last_author:-none})"
                 if gh pr edit "$number" --add-label "$LABEL" \
-                  && gh pr comment "$number" --body "@${author} this PR has had no comment, review reply, or new commit from the author in 8 weeks. It has been labeled \`${LABEL}\`. Please update the PR or comment if you are still working on it."; then
+                  && gh pr comment "$number" --body "@${author} this PR has had no response from the author to review feedback in 8 weeks. It has been labeled \`${LABEL}\`. Please update the PR or comment if you are still working on it."; then
                   labeled=$((labeled + 1))
                 else
                   echo "Failed to label #${number}"
                   failed=$((failed + 1))
                 fi
               else
-                echo "Already labeled #${number} (last author activity ${last})"
+                echo "Already labeled #${number} (unanswered review ${last_reviewer}, last author activity ${last_author:-none})"
               fi
             elif [ "$labeled_already" = "true" ]; then
-              echo "Removing ${LABEL} from #${number} (last author activity ${last})"
+              echo "Removing ${LABEL} from #${number} (reviewer ${last_reviewer:-none}, last author activity ${last_author:-none})"
               if gh pr edit "$number" --remove-label "$LABEL"; then
                 unlabeled=$((unlabeled + 1))
               else
                 echo "Failed to remove ${LABEL} from #${number}"
                 failed=$((failed + 1))
               fi
+            else
+              skipped=$((skipped + 1))
             fi
           done < "$pr_file"
 
